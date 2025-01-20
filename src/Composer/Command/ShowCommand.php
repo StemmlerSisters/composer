@@ -43,6 +43,7 @@ use Composer\Semver\Constraint\ConstraintInterface;
 use Composer\Semver\Semver;
 use Composer\Spdx\SpdxLicenses;
 use Composer\Util\PackageInfo;
+use DateTimeInterface;
 use Symfony\Component\Console\Completion\CompletionInput;
 use Symfony\Component\Console\Formatter\OutputFormatter;
 use Symfony\Component\Console\Formatter\OutputFormatterStyle;
@@ -95,7 +96,7 @@ class ShowCommand extends BaseCommand
                 new InputOption('tree', 't', InputOption::VALUE_NONE, 'List the dependencies as a tree'),
                 new InputOption('latest', 'l', InputOption::VALUE_NONE, 'Show the latest version'),
                 new InputOption('outdated', 'o', InputOption::VALUE_NONE, 'Show the latest version but only for packages that are outdated'),
-                new InputOption('ignore', null, InputOption::VALUE_REQUIRED | InputOption::VALUE_IS_ARRAY, 'Ignore specified package(s). Use it with the --outdated option if you don\'t want to be informed about new versions of some packages.', null, $this->suggestInstalledPackage(false)),
+                new InputOption('ignore', null, InputOption::VALUE_REQUIRED | InputOption::VALUE_IS_ARRAY, 'Ignore specified package(s). Can contain wildcards (*). Use it with the --outdated option if you don\'t want to be informed about new versions of some packages.', null, $this->suggestInstalledPackage(false)),
                 new InputOption('major-only', 'M', InputOption::VALUE_NONE, 'Show only packages that have major SemVer-compatible updates. Use with the --latest or --outdated option.'),
                 new InputOption('minor-only', 'm', InputOption::VALUE_NONE, 'Show only packages that have minor SemVer-compatible updates. Use with the --latest or --outdated option.'),
                 new InputOption('patch-only', null, InputOption::VALUE_NONE, 'Show only packages that have patch SemVer-compatible updates. Use with the --latest or --outdated option.'),
@@ -459,7 +460,7 @@ EOT
         $showMajorOnly = $input->getOption('major-only');
         $showMinorOnly = $input->getOption('minor-only');
         $showPatchOnly = $input->getOption('patch-only');
-        $ignoredPackages = array_map('strtolower', $input->getOption('ignore'));
+        $ignoredPackagesRegex = BasePackage::packageNamesToRegexp(array_map('strtolower', $input->getOption('ignore')));
         $indent = $showAllTypes ? '  ' : '';
         /** @var PackageInterface[] $latestPackages */
         $latestPackages = [];
@@ -478,7 +479,7 @@ EOT
 
                 if ($showLatest && $showVersion) {
                     foreach ($packages[$type] as $package) {
-                        if (is_object($package)) {
+                        if (is_object($package) && !Preg::isMatch($ignoredPackagesRegex, $package->getPrettyName())) {
                             $latestPackage = $this->findLatestPackage($package, $composer, $platformRepo, $showMajorOnly, $showMinorOnly, $showPatchOnly, $platformReqFilter);
                             if ($latestPackage === null) {
                                 continue;
@@ -493,7 +494,7 @@ EOT
                 $writeVersion = !$input->getOption('name-only') && !$input->getOption('path') && $showVersion;
                 $writeLatest = $writeVersion && $showLatest;
                 $writeDescription = !$input->getOption('name-only') && !$input->getOption('path');
-                $writeReleaseDate = $writeLatest && $input->getOption('sort-by-age');
+                $writeReleaseDate = $writeLatest && ($input->getOption('sort-by-age') || $format === 'json');
 
                 $hasOutdatedPackages = false;
 
@@ -520,7 +521,7 @@ EOT
                         $packageIsUpToDate = $latestPackage && $latestPackage->getFullPrettyVersion() === $package->getFullPrettyVersion() && (!$latestPackage instanceof CompletePackageInterface || !$latestPackage->isAbandoned());
                         // When using --major-only, and no bigger version than current major is found then it is considered up to date
                         $packageIsUpToDate = $packageIsUpToDate || ($latestPackage === null && $showMajorOnly);
-                        $packageIsIgnored = \in_array($package->getPrettyName(), $ignoredPackages, true);
+                        $packageIsIgnored = Preg::isMatch($ignoredPackagesRegex, $package->getPrettyName());
                         if ($input->getOption('outdated') && ($packageIsUpToDate || $packageIsIgnored)) {
                             continue;
                         }
@@ -535,10 +536,13 @@ EOT
                             $packageViewData['homepage'] = $package instanceof CompletePackageInterface ? $package->getHomepage() : null;
                             $packageViewData['source'] = PackageInfo::getViewSourceUrl($package);
                         }
-                        $nameLength = max($nameLength, strlen($package->getPrettyName()));
+                        $nameLength = max($nameLength, strlen($packageViewData['name']));
                         if ($writeVersion) {
                             $packageViewData['version'] = $package->getFullPrettyVersion();
-                            $versionLength = max($versionLength, strlen($package->getFullPrettyVersion()));
+                            if ($format === 'text') {
+                                $packageViewData['version'] = ltrim($packageViewData['version'], 'v');
+                            }
+                            $versionLength = max($versionLength, strlen($packageViewData['version']));
                         }
                         if ($writeReleaseDate) {
                             if ($package->getReleaseDate() !== null) {
@@ -547,14 +551,25 @@ EOT
                                     $packageViewData['release-age'] = 'from '.$packageViewData['release-age'];
                                 }
                                 $releaseDateLength = max($releaseDateLength, strlen($packageViewData['release-age']));
+                                $packageViewData['release-date'] = $package->getReleaseDate()->format(DateTimeInterface::ATOM);
                             } else {
                                 $packageViewData['release-age'] = '';
+                                $packageViewData['release-date'] = '';
                             }
                         }
                         if ($writeLatest && $latestPackage) {
                             $packageViewData['latest'] = $latestPackage->getFullPrettyVersion();
+                            if ($format === 'text') {
+                                $packageViewData['latest'] = ltrim($packageViewData['latest'], 'v');
+                            }
                             $packageViewData['latest-status'] = $this->getUpdateStatus($latestPackage, $package);
                             $latestLength = max($latestLength, strlen($packageViewData['latest']));
+
+                            if ($latestPackage->getReleaseDate() !== null) {
+                                $packageViewData['latest-release-date'] = $latestPackage->getReleaseDate()->format(DateTimeInterface::ATOM);
+                            } else {
+                                $packageViewData['latest-release-date'] = '';
+                            }
                         } elseif ($writeLatest) {
                             $packageViewData['latest'] = '[none matched]';
                             $packageViewData['latest-status'] = 'up-to-date';
@@ -802,7 +817,8 @@ EOT
             $pool = $repositorySet->createPoolForPackage($name);
         }
         $matches = $pool->whatProvides($name, $constraint);
-        foreach ($matches as $index => $package) {
+        $literals = [];
+        foreach ($matches as $package) {
             // avoid showing the 9999999-dev alias if the default branch has no branch-alias set
             if ($package instanceof AliasPackage && $package->getVersion() === VersionParser::DEFAULT_BRANCH_ALIAS) {
                 $package = $package->getAliasOf();
@@ -814,11 +830,12 @@ EOT
             }
 
             $versions[$package->getPrettyVersion()] = $package->getVersion();
-            $matches[$index] = $package->getId();
+            $literals[] = $package->getId();
         }
 
         // select preferred package according to policy rules
-        if (null === $matchedPackage && $matches && $preferred = $policy->selectPreferredPackages($pool, $matches)) {
+        if (null === $matchedPackage && \count($literals) > 0) {
+            $preferred = $policy->selectPreferredPackages($pool, $literals);
             $matchedPackage = $pool->literalToPackage($preferred[0]);
         }
 
@@ -1448,7 +1465,7 @@ EOT
         $stability = $composer->getPackage()->getMinimumStability();
         $flags = $composer->getPackage()->getStabilityFlags();
         if (isset($flags[$name])) {
-            $stability = array_search($flags[$name], BasePackage::$stabilities, true);
+            $stability = array_search($flags[$name], BasePackage::STABILITIES, true);
         }
 
         $bestStability = $stability;
